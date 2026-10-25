@@ -29,6 +29,8 @@ TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT = str(os.getenv("TELEGRAM_CHAT_ID", ""))
 FINNHUB_KEY = os.getenv("FINNHUB_API_KEY", "")
 ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+AV_KEY = os.getenv("ALPHAVANTAGE_API_KEY", "")                 # free: 25 requests/day
+AV_REFRESH_HOURS = float(os.getenv("AV_REFRESH_HOURS", "8"))   # ~7 calls per refresh -> 21/day
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-5-5")
 
 PAIRS = [p.strip() for p in os.getenv(
@@ -56,6 +58,7 @@ _watch: dict = {}
 _htf_cache: dict = {}
 _news_cache = {"ts": 0, "scores": {}, "headlines": []}
 _cal_cache = {"ts": 0, "events": []}
+_av_cache = {"ts": 0, "scores": {}}
 
 
 # ---------------- telegram ----------------
@@ -134,8 +137,49 @@ def upcoming_high_impact(pair: str):
     return None
 
 
+def av_news_scores():
+    """Free news sentiment from Alpha Vantage NEWS_SENTIMENT, one call per currency/coin.
+    Averages relevance-weighted ticker sentiment (-1..1) and maps it to -2..2."""
+    if time.time() - _av_cache["ts"] < AV_REFRESH_HOURS * 3600:
+        return _av_cache["scores"]
+    codes = set()
+    for p in PAIRS:
+        if "/" in p:
+            for c in p.split("/"):
+                if c not in METALS | OIL:
+                    codes.add(c)
+    scores = dict(_av_cache["scores"])
+    for code in sorted(codes):
+        ticker = f"CRYPTO:{code}" if code in CRYPTO else f"FOREX:{code}"
+        try:
+            r = requests.get("https://www.alphavantage.co/query",
+                             params={"function": "NEWS_SENTIMENT", "tickers": ticker,
+                                     "sort": "LATEST", "limit": 50, "apikey": AV_KEY}, timeout=30)
+            feed = r.json().get("feed")
+            if feed is None:
+                log.warning("alpha vantage: %s", str(r.json())[:150])  # usually the daily limit
+                break
+            num = den = 0.0
+            for art in feed:
+                for ts in art.get("ticker_sentiment", []):
+                    if ts.get("ticker") == ticker:
+                        w = float(ts.get("relevance_score", 0))
+                        num += w * float(ts.get("ticker_sentiment_score", 0))
+                        den += w
+            avg = num / den if den else 0.0
+            scores[code] = max(-2, min(2, round(avg / 0.25)))
+        except Exception as e:
+            log.warning("alpha vantage %s failed: %s", ticker, e)
+        time.sleep(13)  # free tier allows ~5 calls/min
+    _av_cache.update(ts=time.time(), scores=scores)
+    log.info("alpha vantage sentiment: %s", scores)
+    return scores
+
+
 def get_news_scores():
-    """Sentiment per currency in [-2, 2]. Needs FINNHUB + ANTHROPIC keys; otherwise neutral."""
+    """Sentiment per currency in [-2, 2]: Alpha Vantage (free) if keyed, else Finnhub+Claude, else neutral."""
+    if AV_KEY:
+        return av_news_scores(), []
     if time.time() - _news_cache["ts"] < 1800:
         return _news_cache["scores"], _news_cache["headlines"]
     scores, heads = {}, []
@@ -448,6 +492,10 @@ def scan(force: bool = False, reply_chat: str = None):
             heartbeat(status_text())
         return
     sent = 0
+    try:
+        get_news_scores()
+    except Exception as e:
+        log.warning("news refresh failed: %s", e)
     for pair in pairs:
         try:
             last = _last_signal.get(pair)
@@ -532,7 +580,7 @@ def poll_commands():
                 elif text.startswith("/status"):
                     tg_send(f"Pairs: {', '.join(PAIRS)}\nTF: {HTF}→{ENTRY_TF}\nMin score: {MIN_SCORE}\n"
                             f"Forex/metals session UTC: {SESSION_START_UTC}-{SESSION_END_UTC}; crypto 24/7; US ETFs 13-20\n"
-                            f"News scoring: {'on' if FINNHUB_KEY and ANTHROPIC_KEY else 'off'}", chat)
+                            f"News scoring: {'Alpha Vantage' if AV_KEY else ('Finnhub+Claude' if FINNHUB_KEY and ANTHROPIC_KEY else 'off')}", chat)
         except Exception as e:
             log.error("poll error: %s", e)
             time.sleep(5)
