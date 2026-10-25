@@ -52,13 +52,20 @@ _cal_cache = {"ts": 0, "events": []}
 
 # ---------------- telegram ----------------
 def tg_send(text: str, chat_id: str = None):
-    r = requests.post(
-        f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-        json={"chat_id": chat_id or TG_CHAT, "text": text, "parse_mode": "HTML"},
-        timeout=20,
-    )
-    if not r.ok:
-        log.error("telegram error: %s", r.text)
+    """Send a Telegram message; retries on network errors and never crashes the bot."""
+    for attempt in range(3):
+        try:
+            r = requests.post(
+                f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                json={"chat_id": chat_id or TG_CHAT, "text": text, "parse_mode": "HTML"},
+                timeout=40,
+            )
+            if not r.ok:
+                log.error("telegram error: %s", r.text)
+            return
+        except requests.RequestException as e:
+            log.warning("telegram send attempt %d failed: %s", attempt + 1, e)
+            time.sleep(3)
 
 
 # ---------------- data ----------------
@@ -349,12 +356,17 @@ def poll_commands():
                 m = u.get("message", {})
                 chat = str(m.get("chat", {}).get("id", ""))
                 text = (m.get("text") or "").strip().lower()
+                if text:
+                    log.info("telegram message from chat %s: %s", chat, text[:30])
                 if chat != TG_CHAT:
+                    if text.startswith("/"):
+                        log.warning("ignored command from chat %s (TELEGRAM_CHAT_ID is %s)", chat, TG_CHAT)
                     continue
                 if text.startswith("/start"):
                     tg_send("Forex SMC bot online.\n/scan – scan now\n/status – settings", chat)
                 elif text.startswith("/scan"):
-                    tg_send("Scanning…", chat)
+                    tg_send("Scanning… (forex market is closed on weekends, so data may be from Friday)"
+                            if datetime.now(timezone.utc).weekday() >= 5 else "Scanning…", chat)
                     threading.Thread(target=scan, kwargs={"force": True, "reply_chat": chat}, daemon=True).start()
                 elif text.startswith("/status"):
                     tg_send(f"Pairs: {', '.join(PAIRS)}\nTF: {HTF}→{ENTRY_TF}\nMin score: {MIN_SCORE}\n"
