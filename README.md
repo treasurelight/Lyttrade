@@ -1,0 +1,2 @@
+# Lyttrade
+Trading bot
