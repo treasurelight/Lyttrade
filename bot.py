@@ -43,6 +43,9 @@ SESSION_START_UTC = int(os.getenv("SESSION_START_UTC", "7"))   # London open
 SESSION_END_UTC = int(os.getenv("SESSION_END_UTC", "20"))      # NY close-ish
 NEWS_BLACKOUT_MIN = int(os.getenv("NEWS_BLACKOUT_MIN", "30"))
 API_PAUSE_SEC = float(os.getenv("API_PAUSE_SEC", "8"))         # free TwelveData: 8 req/min
+HEARTBEAT_HOURS = float(os.getenv("HEARTBEAT_HOURS", "2"))     # status message when nothing to report
+EAT = timezone(timedelta(hours=3))
+_last_beat = 0.0
 
 _last_signal: dict = {}
 _htf_cache: dict = {}
@@ -308,9 +311,46 @@ def in_session() -> bool:
     return now.weekday() < 5 and SESSION_START_UTC <= now.hour < SESSION_END_UTC
 
 
+def market_open_now() -> bool:
+    """Forex trades Sun 22:00 UTC to Fri 22:00 UTC."""
+    now = datetime.now(timezone.utc)
+    wd = now.weekday()
+    if wd == 5 or (wd == 4 and now.hour >= 22) or (wd == 6 and now.hour < 22):
+        return False
+    return True
+
+
+def next_scan_start() -> datetime:
+    now = datetime.now(timezone.utc)
+    d = now.replace(hour=SESSION_START_UTC, minute=0, second=0, microsecond=0)
+    if d <= now:
+        d += timedelta(days=1)
+    while d.weekday() >= 5:
+        d += timedelta(days=1)
+    return d
+
+
+def status_text() -> str:
+    nxt = next_scan_start()
+    why = ("Forex market is closed for the weekend." if not market_open_now()
+           else "Outside the London/NY trading session.")
+    return (f"😴 {why} No setups to scan right now.\n"
+            f"Next scan: {nxt:%a %H:%M} UTC ({nxt.astimezone(EAT):%a %H:%M} EAT).")
+
+
+def heartbeat(msg: str):
+    """Status message at most every HEARTBEAT_HOURS, so the bot is never silent."""
+    global _last_beat
+    if time.time() - _last_beat >= HEARTBEAT_HOURS * 3600:
+        tg_send(msg)
+        _last_beat = time.time()
+
+
 def scan(force: bool = False, reply_chat: str = None):
+    global _last_beat
     if not force and not in_session():
         log.info("outside session, skipping")
+        heartbeat(status_text())
         return
     sent = 0
     for pair in PAIRS:
@@ -329,8 +369,13 @@ def scan(force: bool = False, reply_chat: str = None):
                 sent += 1
         except Exception as e:
             log.error("%s failed: %s", pair, e)
-    if reply_chat and sent == 0:
+    if sent:
+        _last_beat = time.time()
+    elif reply_chat:
         tg_send("Scan complete: no high-confluence setups right now.", reply_chat)
+    else:
+        heartbeat(f"🔎 Scanned {len(PAIRS)} pairs: no high-confluence setups right now. "
+                  f"Still watching, next scan in {SCAN_EVERY_MIN} min.")
 
 
 # ---------------- command polling + scheduler ----------------
@@ -364,9 +409,10 @@ def poll_commands():
                     continue
                 if text.startswith("/start"):
                     tg_send("Forex SMC bot online.\n/scan – scan now\n/status – settings", chat)
+                elif text.startswith("/scan") and not market_open_now():
+                    tg_send(status_text(), chat)
                 elif text.startswith("/scan"):
-                    tg_send("Scanning… (forex market is closed on weekends, so data may be from Friday)"
-                            if datetime.now(timezone.utc).weekday() >= 5 else "Scanning…", chat)
+                    tg_send("Scanning…", chat)
                     threading.Thread(target=scan, kwargs={"force": True, "reply_chat": chat}, daemon=True).start()
                 elif text.startswith("/status"):
                     tg_send(f"Pairs: {', '.join(PAIRS)}\nTF: {HTF}→{ENTRY_TF}\nMin score: {MIN_SCORE}\n"
