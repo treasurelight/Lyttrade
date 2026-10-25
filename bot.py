@@ -43,6 +43,8 @@ SESSION_START_UTC = int(os.getenv("SESSION_START_UTC", "7"))   # London open
 SESSION_END_UTC = int(os.getenv("SESSION_END_UTC", "20"))      # NY close-ish
 NEWS_BLACKOUT_MIN = int(os.getenv("NEWS_BLACKOUT_MIN", "30"))
 API_PAUSE_SEC = float(os.getenv("API_PAUSE_SEC", "8"))         # free TwelveData: 8 req/min
+MAX_DATA_AGE_MIN = int(os.getenv("MAX_DATA_AGE_MIN", "45"))   # reject stale candles
+MIN_SL_PIPS = float(os.getenv("MIN_SL_PIPS", "10"))            # never give a tighter stop than this
 HEARTBEAT_HOURS = float(os.getenv("HEARTBEAT_HOURS", "2"))     # status message when nothing to report
 EAT = timezone(timedelta(hours=3))
 _last_beat = 0.0
@@ -175,6 +177,10 @@ def analyse(pair: str):
     """Returns signal dict or None."""
     ltf = fetch_candles(pair, ENTRY_TF, 300)
     htf = get_htf(pair)
+    age_min = (datetime.now(timezone.utc).replace(tzinfo=None) - ltf["datetime"].iloc[-1]).total_seconds() / 60
+    if age_min > MAX_DATA_AGE_MIN:
+        log.info("%s: latest candle is %.0f min old (market closed/stale feed), skipping", pair, age_min)
+        return None
     price = ltf["close"].iloc[-1]
     a = smc.atr(ltf).iloc[-1]
 
@@ -278,6 +284,7 @@ def analyse(pair: str):
     risk = max(risk, 0.8 * a)
     if risk > 3 * a:
         return None  # stop too wide, skip
+    risk = max(risk, MIN_SL_PIPS * pip(pair))  # realistic minimum stop distance
     sl_p = price - risk if side == "BUY" else price + risk
     d = 1 if side == "BUY" else -1
     tp1, tp2 = price + d * risk * MIN_RR, price + d * risk * (MIN_RR + 1)
