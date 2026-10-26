@@ -5,9 +5,11 @@ Sends: pair, BUY/SELL, entry, SL, TP1, TP2.
 
 NOT financial advice. Signals are probabilistic; always use proper risk management.
 """
+import html
 import json
 import logging
 import os
+import re
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import time
@@ -40,7 +42,7 @@ ENTRY_TF = os.getenv("ENTRY_TF", "15min")
 HTF = os.getenv("HTF", "4h")
 MIN_SCORE = float(os.getenv("MIN_SCORE", "6"))          # max possible is ~13
 MIN_RR = float(os.getenv("MIN_RR", "2"))
-SCAN_EVERY_MIN = int(os.getenv("SCAN_EVERY_MIN", "15"))
+SCAN_EVERY_MIN = int(os.getenv("SCAN_EVERY_MIN", "10"))
 COOLDOWN_HOURS = float(os.getenv("COOLDOWN_HOURS", "4"))
 SESSION_START_UTC = int(os.getenv("SESSION_START_UTC", "7"))   # London open
 SESSION_END_UTC = int(os.getenv("SESSION_END_UTC", "20"))      # NY close-ish
@@ -64,17 +66,23 @@ _av_cache = {"ts": 0, "scores": {}}
 
 # ---------------- telegram ----------------
 def tg_send(text: str, chat_id: str = None):
-    """Send to one chat, or broadcast to every chat in TELEGRAM_CHAT_ID. Retries; never crashes the bot."""
+    """Send to one chat, or broadcast to every chat in TELEGRAM_CHAT_ID.
+    Retries on network errors; if Telegram rejects the formatting, resends as plain text."""
     for target in ([chat_id] if chat_id else CHAT_IDS):
+        body, mode = text, "HTML"
         for attempt in range(3):
             try:
-                r = requests.post(
-                    f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-                    json={"chat_id": target, "text": text, "parse_mode": "HTML"},
-                    timeout=40,
-                )
-                if not r.ok:
-                    log.error("telegram error (%s): %s", target, r.text)
+                payload = {"chat_id": target, "text": body}
+                if mode:
+                    payload["parse_mode"] = mode
+                r = requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                                  json=payload, timeout=40)
+                if r.ok:
+                    break
+                log.error("telegram error (%s): %s", target, r.text)
+                if "parse entities" in r.text and mode:
+                    body, mode = html.unescape(re.sub(r"</?(b|code)>", "", text)), None
+                    continue  # retry immediately as plain text
                 break
             except requests.RequestException as e:
                 log.warning("telegram send attempt %d failed: %s", attempt + 1, e)
@@ -82,8 +90,23 @@ def tg_send(text: str, chat_id: str = None):
 
 
 # ---------------- data ----------------
+_calls = {"day": "", "n": 0}
+_quota = {"day": ""}
+
+
+def count_call():
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if _calls["day"] != today:
+        _calls.update(day=today, n=0)
+    _calls["n"] += 1
+
+
 def fetch_candles(pair: str, interval: str, size: int = 300) -> pd.DataFrame:
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if _quota["day"] == today:
+        raise RuntimeError("daily data limit reached")
     time.sleep(API_PAUSE_SEC)
+    count_call()
     r = requests.get(
         "https://api.twelvedata.com/time_series",
         params={"symbol": pair, "interval": interval, "outputsize": size,
@@ -92,6 +115,12 @@ def fetch_candles(pair: str, interval: str, size: int = 300) -> pd.DataFrame:
     )
     data = r.json()
     if data.get("status") == "error" or "values" not in data:
+        msg = str(data.get("message", data))
+        if data.get("code") == 429 and ("day" in msg.lower() or "daily" in msg.lower()):
+            _quota["day"] = today
+            tg_send("⏸ Daily data limit reached on the free Twelve Data plan. Scanning pauses until "
+                    "00:00 UTC (03:00 EAT), then resumes by itself. Fewer markets or a longer scan "
+                    "interval avoids this.")
         raise RuntimeError(f"{pair} {interval}: {data.get('message', data)}")
     df = pd.DataFrame(data["values"])
     for c in ("open", "high", "low", "close"):
@@ -102,7 +131,7 @@ def fetch_candles(pair: str, interval: str, size: int = 300) -> pd.DataFrame:
 
 def get_htf(pair: str) -> pd.DataFrame:
     cached = _htf_cache.get(pair)
-    if cached and time.time() - cached[0] < 10800:
+    if cached and time.time() - cached[0] < 14400:
         return cached[1]
     df = fetch_candles(pair, HTF, 200)
     _htf_cache[pair] = (time.time(), df)
@@ -395,8 +424,8 @@ def format_signal(s: dict) -> str:
         f"TP1: <code>{fmt(p, s['tp1'])}</code> (1:{MIN_RR:g})\n"
         f"TP2: <code>{fmt(p, s['tp2'])}</code> (1:{MIN_RR + 1:g})\n"
         f"Confluence: {s['score']:.0f} pts (~{conf}%)\n"
-        f"News: {s['news']}\n\n"
-        + "\n".join(f"• {r}" for r in s["reasons"])
+        f"News: {html.escape(s['news'])}\n\n"
+        + "\n".join(f"• {html.escape(r)}" for r in s["reasons"])
         + "\n\n⚠️ Not financial advice. Risk ≤1% per trade. Move SL to breakeven at TP1."
     )
 
@@ -412,7 +441,7 @@ def format_watch(w: dict) -> str:
         f"<code>{fmt(p, w['trigger'])}</code>\n"
         f"❌ Idea is dead if price closes {'below' if up else 'above'} "
         f"<code>{fmt(p, w['invalid'])}</code>\n\n"
-        "Why it's on watch:\n" + "\n".join(f"• {r}" for r in w["reasons"])
+        "Why it's on watch:\n" + "\n".join(f"• {html.escape(r)}" for r in w["reasons"])
         + "\n\nI'll message you when it confirms or fails."
     )
 
@@ -637,6 +666,7 @@ def poll_commands():
                 elif cmd == "/status":
                     tg_send(f"Pairs: {', '.join(PAIRS)}\nTF: {HTF}→{ENTRY_TF}\nMin score: {MIN_SCORE}\n"
                             f"Forex/metals session UTC: {SESSION_START_UTC}-{SESSION_END_UTC}; crypto 24/7; US ETFs 13-20\n"
+                            f"Scan every {SCAN_EVERY_MIN} min · data calls today: {_calls['n']}/800\n"
                             f"News scoring: {'Alpha Vantage' if AV_KEY else ('Finnhub+Claude' if FINNHUB_KEY and ANTHROPIC_KEY else 'off')}", chat)
         except Exception as e:
             log.error("poll error: %s", e)
