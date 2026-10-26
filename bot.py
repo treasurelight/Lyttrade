@@ -601,10 +601,25 @@ def serve_health():
         HTTPServer(("0.0.0.0", port), _Health).serve_forever()
 
 
+def keep_awake():
+    """Render's free plan sleeps after ~15 min without inbound HTTP traffic. Pinging our own
+    public URL counts as traffic, so the bot stays up while it is running."""
+    url = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("KEEPALIVE_URL", "")
+    if not url:
+        return
+    while True:
+        time.sleep(600)
+        try:
+            requests.get(url, timeout=30)
+        except Exception as e:
+            log.warning("keepalive ping failed: %s", e)
+
+
 if __name__ == "__main__":
     if not (TD_KEY and TG_TOKEN and TG_CHAT):
         raise SystemExit("Set TWELVEDATA_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID in .env")
     threading.Thread(target=serve_health, daemon=True).start()
+    threading.Thread(target=keep_awake, daemon=True).start()
     tg_send("✅ Forex SMC bot started.")
     threading.Thread(target=scheduler, daemon=True).start()
     poll_commands()
