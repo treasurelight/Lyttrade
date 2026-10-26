@@ -26,7 +26,8 @@ log = logging.getLogger("fxbot")
 # ---------------- config ----------------
 TD_KEY = os.getenv("TWELVEDATA_API_KEY", "")
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TG_CHAT = str(os.getenv("TELEGRAM_CHAT_ID", ""))
+CHAT_IDS = [c.strip() for c in os.getenv("TELEGRAM_CHAT_ID", "").split(",") if c.strip()]
+TG_CHAT = CHAT_IDS[0] if CHAT_IDS else ""
 FINNHUB_KEY = os.getenv("FINNHUB_API_KEY", "")
 ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 AV_KEY = os.getenv("ALPHAVANTAGE_API_KEY", "")                 # free: 25 requests/day
@@ -63,20 +64,21 @@ _av_cache = {"ts": 0, "scores": {}}
 
 # ---------------- telegram ----------------
 def tg_send(text: str, chat_id: str = None):
-    """Send a Telegram message; retries on network errors and never crashes the bot."""
-    for attempt in range(3):
-        try:
-            r = requests.post(
-                f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-                json={"chat_id": chat_id or TG_CHAT, "text": text, "parse_mode": "HTML"},
-                timeout=40,
-            )
-            if not r.ok:
-                log.error("telegram error: %s", r.text)
-            return
-        except requests.RequestException as e:
-            log.warning("telegram send attempt %d failed: %s", attempt + 1, e)
-            time.sleep(3)
+    """Send to one chat, or broadcast to every chat in TELEGRAM_CHAT_ID. Retries; never crashes the bot."""
+    for target in ([chat_id] if chat_id else CHAT_IDS):
+        for attempt in range(3):
+            try:
+                r = requests.post(
+                    f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                    json={"chat_id": target, "text": text, "parse_mode": "HTML"},
+                    timeout=40,
+                )
+                if not r.ok:
+                    log.error("telegram error (%s): %s", target, r.text)
+                break
+            except requests.RequestException as e:
+                log.warning("telegram send attempt %d failed: %s", attempt + 1, e)
+                time.sleep(3)
 
 
 # ---------------- data ----------------
@@ -551,6 +553,46 @@ def scheduler():
             log.error("scan crashed: %s", e)
 
 
+ALIASES = {"GOLD": "XAU/USD", "XAU": "XAU/USD", "SILVER": "XAG/USD", "BTC": "BTC/USD", "BITCOIN": "BTC/USD",
+           "ETH": "ETH/USD", "OIL": "USO", "USOIL": "USO", "SPX": "SPY", "SP500": "SPY", "US500": "SPY",
+           "NAS": "QQQ", "NAS100": "QQQ", "NASDAQ": "QQQ", "US100": "QQQ"}
+
+
+def parse_pair(arg: str):
+    a = arg.upper().replace(" ", "").replace("-", "").replace("_", "")
+    if a in ALIASES:
+        return ALIASES[a]
+    if "/" in a:
+        return a
+    if len(a) == 6 and a.isalpha():
+        return f"{a[:3]}/{a[3:]}"
+    return a if a else None
+
+
+def signal_for(pair: str, chat: str):
+    """On-demand analysis of one market: signal, hold-on, or wait."""
+    try:
+        res = analyse(pair)
+    except Exception as e:
+        tg_send(f"Couldn't analyse {pair}: {str(e)[:150]}", chat)
+        return
+    if res is None:
+        tg_send(f"⏸ {pair}: no live prices right now (market closed or data delayed). Try again when it's open.", chat)
+    elif res["type"] == "signal":
+        tg_send(format_signal(res), chat)
+    elif res["type"] == "watch":
+        tg_send(format_watch(res), chat)
+    else:
+        tg_send(f"⏳ <b>{pair}</b>: no clear setup yet (price {fmt(pair, res['price'])}). "
+                "Hold off and wait. I'll alert you when something forms.", chat)
+
+
+HELP = ("Forex SMC bot commands:\n"
+        "/signal EURUSD – analyse one market now (also: gold, btc, eth, oil, nas100, spx)\n"
+        "/scan – scan all markets\n/watch – setups I'm watching\n/status – settings\n"
+        "/id – show this chat's ID")
+
+
 def poll_commands():
     offset = None
     while True:
@@ -562,22 +604,37 @@ def poll_commands():
                 m = u.get("message", {})
                 chat = str(m.get("chat", {}).get("id", ""))
                 text = (m.get("text") or "").strip().lower()
-                if text:
-                    log.info("telegram message from chat %s: %s", chat, text[:30])
-                if chat != TG_CHAT:
-                    if text.startswith("/"):
-                        log.warning("ignored command from chat %s (TELEGRAM_CHAT_ID is %s)", chat, TG_CHAT)
+                if not text.startswith("/"):
                     continue
-                if text.startswith("/start"):
-                    tg_send("Forex SMC bot online.\n/scan – scan now\n/watch – setups being watched\n/status – settings", chat)
-                elif text.startswith("/scan") and not any(pair_market_open(p) for p in PAIRS):
+                parts = text.split()
+                cmd = parts[0].split("@")[0]          # "/scan@MyBot" in groups -> "/scan"
+                args = " ".join(parts[1:])
+                log.info("command %s from chat %s", cmd, chat)
+                if cmd == "/id":                       # works anywhere, so you can find a group's ID
+                    tg_send(f"This chat's ID: <code>{chat}</code>", chat)
+                    continue
+                if chat not in CHAT_IDS:
+                    log.warning("ignored command from chat %s (allowed: %s)", chat, CHAT_IDS)
+                    tg_send("This chat isn't authorised yet. Add this chat ID to TELEGRAM_CHAT_ID: "
+                            f"<code>{chat}</code>", chat)
+                    continue
+                if cmd in ("/start", "/help"):
+                    tg_send(HELP, chat)
+                elif cmd == "/signal":
+                    pair = parse_pair(args)
+                    if not pair:
+                        tg_send("Usage: /signal EURUSD  (or gold, btc, eth, oil, nas100, spx)", chat)
+                    else:
+                        tg_send(f"Analysing {pair}… (about 20 seconds)", chat)
+                        threading.Thread(target=signal_for, args=(pair, chat), daemon=True).start()
+                elif cmd == "/scan" and not any(pair_market_open(p) for p in PAIRS):
                     tg_send(status_text(), chat)
-                elif text.startswith("/scan"):
+                elif cmd == "/scan":
                     tg_send("Scanning…", chat)
                     threading.Thread(target=scan, kwargs={"force": True, "reply_chat": chat}, daemon=True).start()
-                elif text.startswith("/watch"):
+                elif cmd == "/watch":
                     tg_send(("👀 Watchlist" + watch_lines()) if _watch else "Nothing on watch right now.", chat)
-                elif text.startswith("/status"):
+                elif cmd == "/status":
                     tg_send(f"Pairs: {', '.join(PAIRS)}\nTF: {HTF}→{ENTRY_TF}\nMin score: {MIN_SCORE}\n"
                             f"Forex/metals session UTC: {SESSION_START_UTC}-{SESSION_END_UTC}; crypto 24/7; US ETFs 13-20\n"
                             f"News scoring: {'Alpha Vantage' if AV_KEY else ('Finnhub+Claude' if FINNHUB_KEY and ANTHROPIC_KEY else 'off')}", chat)
@@ -616,7 +673,7 @@ def keep_awake():
 
 
 if __name__ == "__main__":
-    if not (TD_KEY and TG_TOKEN and TG_CHAT):
+    if not (TD_KEY and TG_TOKEN and CHAT_IDS):
         raise SystemExit("Set TWELVEDATA_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID in .env")
     threading.Thread(target=serve_health, daemon=True).start()
     threading.Thread(target=keep_awake, daemon=True).start()
