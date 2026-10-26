@@ -49,13 +49,52 @@ API_PAUSE_SEC = float(os.getenv("API_PAUSE_SEC", "8"))         # free TwelveData
 MAX_DATA_AGE_MIN = int(os.getenv("MAX_DATA_AGE_MIN", "45"))   # reject stale candles
 MIN_SL_PIPS = float(os.getenv("MIN_SL_PIPS", "10"))            # never give a tighter stop than this
 WATCH_SCORE = float(os.getenv("WATCH_SCORE", "4"))            # forming setup -> "hold on" alert
-WATCH_EXPIRE_HOURS = float(os.getenv("WATCH_EXPIRE_HOURS", "8"))
+WATCH_EXPIRE_HOURS = float(os.getenv("WATCH_EXPIRE_HOURS", "8"))     # bot-created watches
+WATCH_USER_EXPIRE_HOURS = float(os.getenv("WATCH_USER_EXPIRE_HOURS", "24"))  # /watch requests
+MAX_WATCHES = int(os.getenv("MAX_WATCHES", "5"))
+WATCH_FILE = os.getenv("WATCH_FILE", "watch_state.json")
 HEARTBEAT_HOURS = float(os.getenv("HEARTBEAT_HOURS", "2"))     # status message when nothing to report
 EAT = timezone(timedelta(hours=3))
 _last_beat = 0.0
 
 _last_signal: dict = {}
 _watch: dict = {}
+
+
+def save_watch():
+    try:
+        with open(WATCH_FILE, "w") as f:
+            json.dump(_watch, f)
+    except Exception as e:
+        log.warning("couldn't save watches: %s", e)
+
+
+def load_watch():
+    try:
+        with open(WATCH_FILE) as f:
+            _watch.update(json.load(f))
+        if _watch:
+            log.info("restored %d watches: %s", len(_watch), list(_watch))
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log.warning("couldn't load watches: %s", e)
+
+
+def set_watch(pair: str, w: dict):
+    _watch[pair] = w
+    save_watch()
+
+
+def drop_watch(pair: str):
+    if _watch.pop(pair, None) is not None:
+        save_watch()
+
+
+def auto_watch(res: dict) -> dict:
+    return {"side": res["side"], "trigger": float(res["trigger"]), "invalid": float(res["invalid"]),
+            "ts": time.time(), "source": "auto", "expire_h": WATCH_EXPIRE_HOURS,
+            "last_price": float(res["price"])}
 _htf_cache: dict = {}
 _news_cache = {"ts": 0, "scores": {}, "headlines": []}
 _cal_cache = {"ts": 0, "events": []}
@@ -255,6 +294,7 @@ def analyse(pair: str, min_score: float = None):
         log.info("%s: latest candle is %.0f min old (market closed/stale feed), skipping", pair, age_min)
         return None
     price = ltf["close"].iloc[-1]
+    last_close = float(ltf["close"].iloc[-2]) if len(ltf) > 1 else float(price)  # last CLOSED candle
     a = smc.atr(ltf).iloc[-1]
 
     buy, sell = 0.0, 0.0
@@ -363,7 +403,7 @@ def analyse(pair: str, min_score: float = None):
                 "type": "signal", "pair": pair, "side": side, "entry": price,
                 "sl": price - d * risk, "tp1": price + d * risk * MIN_RR,
                 "tp2": price + d * risk * (MIN_RR + 1), "risk_txt": risk_txt, "price": price,
-                "score": score, "reasons": reasons, "news": news_txt, "htf_trend": htrend,
+                "score": score, "reasons": reasons, "news": news_txt, "htf_trend": htrend, "last_close": last_close,
             }
 
     if score >= WATCH_SCORE and score - opposing >= 2 and not htf_against:
@@ -379,9 +419,9 @@ def analyse(pair: str, min_score: float = None):
             inv = above[-1] if above else price + 2 * a
         inv = min(inv, price - 0.5 * a) if side == "BUY" else max(inv, price + 0.5 * a)
         return {"type": "watch", "pair": pair, "side": side, "trigger": trig, "invalid": inv,
-                "score": score, "reasons": reasons, "price": price}
+                "score": score, "reasons": reasons, "price": price, "last_close": last_close}
 
-    return {"type": "none", "price": price}
+    return {"type": "none", "price": price, "last_close": last_close}
 
 
 def format_signal(s: dict) -> str:
@@ -472,9 +512,16 @@ def status_text() -> str:
 def watch_lines() -> str:
     if not _watch:
         return ""
-    return "\n\n👀 Watching:\n" + "\n".join(
-        f"• {w['side']} {p}: close {'above' if w['side'] == 'BUY' else 'below'} {fmt(p, w['trigger'])}"
-        for p, w in _watch.items())
+    out = []
+    for p, w in _watch.items():
+        now = f" (now {fmt(p, w['last_price'])})" if w.get("last_price") else ""
+        if w.get("trigger") is None:
+            out.append(f"• {p}: monitoring for a setup{now}")
+        else:
+            up = w["side"] == "BUY"
+            inv = f", idea dead {'below' if up else 'above'} {fmt(p, w['invalid'])}" if w.get("invalid") is not None else ""
+            out.append(f"• {p}: waiting for a 15min close {'above' if up else 'below'} {fmt(p, w['trigger'])}{now}{inv}")
+    return "\n\n👀 Watching:\n" + "\n".join(out)
 
 
 def heartbeat(msg: str):
@@ -485,9 +532,78 @@ def heartbeat(msg: str):
         _last_beat = time.time()
 
 
+def expire_watches():
+    for pair, w in list(_watch.items()):
+        h = w.get("expire_h", WATCH_EXPIRE_HOURS)
+        if time.time() - w["ts"] > h * 3600:
+            tg_send(f"⌛ Stopped watching <b>{pair}</b>: nothing happened in {h:g}h. "
+                    f"Send /watch {pair.replace('/', '')} to start again.")
+            drop_watch(pair)
+
+
+def handle_pair(pair: str, reply_chat: str = None) -> int:
+    """Analyse one market and handle any watch on it. Returns messages sent that count as news."""
+    w = _watch.get(pair)
+    last = _last_signal.get(pair)
+    if last and not w and datetime.now() - last < timedelta(hours=COOLDOWN_HOURS):
+        return 0
+    ev = upcoming_high_impact(pair)
+    if ev:
+        log.info("%s blocked by news: %s", pair, ev)
+        return 0
+    res = analyse(pair, MIN_SCORE - 1 if (w and w.get("trigger") is not None) else None)
+    if not res:
+        return 0  # stale data
+    px, lc = res["price"], res["last_close"]
+    if w:
+        w["last_price"] = float(px)
+        save_watch()
+
+    if res["type"] == "signal":
+        head = "✅ <b>CONFIRMED</b> (you were watching this)\n" if w else ""
+        tg_send(head + format_signal(res), reply_chat)
+        drop_watch(pair)
+        _last_signal[pair] = datetime.now()
+        return 1
+
+    if w:
+        side, trig, inv = w.get("side"), w.get("trigger"), w.get("invalid")
+        up = side == "BUY"
+        if side and inv is not None and ((up and lc < inv) or (not up and lc > inv)):
+            tg_send(f"❌ <b>{pair}</b>: {side} idea is dead. A 15min candle closed {fmt(pair, lc)}, "
+                    f"{'below' if up else 'above'} {fmt(pair, inv)}. Stopped watching.")
+            drop_watch(pair)
+            return 1
+        if side and trig is not None and ((up and lc > trig) or (not up and lc < trig)):
+            msg = (f"🔔 <b>{pair}</b>: a 15min candle closed {'above' if up else 'below'} "
+                   f"<code>{fmt(pair, trig)}</code> (price now {fmt(pair, px)}).\n")
+            if res["type"] == "watch":
+                msg += (f"Setup is building ({res['side']}, {res['score']:.0f} pts) but not strong enough for a full "
+                        "entry yet. Be patient and wait for a pullback or more confirmation.")
+            else:
+                msg += "No clear SMC setup at this level. Hold off."
+            tg_send(msg)
+            drop_watch(pair)
+            return 1
+        if trig is None and res["type"] == "watch":  # a /watch request that now has a setup forming
+            set_watch(pair, auto_watch(res))
+            tg_send(format_watch(res))
+            return 1
+        return 0
+
+    if res["type"] == "watch":
+        set_watch(pair, auto_watch(res))
+        tg_send(format_watch(res), reply_chat)
+        return 1
+    return 0
+
+
 def scan(force: bool = False, reply_chat: str = None):
     global _last_beat
-    pairs = [p for p in PAIRS if (pair_market_open(p) if force else pair_in_session(p))]
+    expire_watches()
+    ok = pair_market_open if force else pair_in_session
+    pairs = [p for p in PAIRS if ok(p)]
+    pairs += [p for p in _watch if p not in pairs and ok(p)]  # watched markets outside the default list
     if not pairs:
         log.info("no markets in session, skipping")
         if not force:
@@ -500,36 +616,7 @@ def scan(force: bool = False, reply_chat: str = None):
         log.warning("news refresh failed: %s", e)
     for pair in pairs:
         try:
-            last = _last_signal.get(pair)
-            if last and datetime.now() - last < timedelta(hours=COOLDOWN_HOURS):
-                continue
-            ev = upcoming_high_impact(pair)
-            if ev:
-                log.info("%s blocked by news: %s", pair, ev)
-                continue
-            w = _watch.get(pair)
-            res = analyse(pair, MIN_SCORE - 1 if w else None)
-            if not res:
-                continue  # stale data
-            if res["type"] == "signal":
-                head = "✅ <b>CONFIRMED</b> (was on watch)\n" if w else ""
-                tg_send(head + format_signal(res), reply_chat)
-                _watch.pop(pair, None)
-                _last_signal[pair] = datetime.now()
-                sent += 1
-            elif w:
-                px = res["price"]
-                if (w["side"] == "BUY" and px < w["invalid"]) or (w["side"] == "SELL" and px > w["invalid"]):
-                    tg_send(f"❌ {w['side']} {pair} idea invalidated (price {fmt(pair, px)}). Back to scanning.", reply_chat)
-                    _watch.pop(pair, None)
-                elif time.time() - w["ts"] > WATCH_EXPIRE_HOURS * 3600:
-                    tg_send(f"⌛ Dropped the {w['side']} {pair} watch: nothing confirmed in {WATCH_EXPIRE_HOURS:g}h.", reply_chat)
-                    _watch.pop(pair, None)
-            elif res["type"] == "watch":
-                _watch[pair] = {"side": res["side"], "trigger": res["trigger"],
-                                "invalid": res["invalid"], "ts": time.time()}
-                tg_send(format_watch(res), reply_chat)
-                sent += 1
+            sent += handle_pair(pair, reply_chat)
         except Exception as e:
             log.error("%s failed: %s", pair, e)
     if sent:
@@ -581,15 +668,96 @@ def signal_for(pair: str, chat: str):
     elif res["type"] == "signal":
         tg_send(format_signal(res), chat)
     elif res["type"] == "watch":
-        tg_send(format_watch(res), chat)
+        if pair in _watch or len(_watch) < MAX_WATCHES:
+            set_watch(pair, auto_watch(res))
+            tg_send(format_watch(res), chat)
+        else:
+            tg_send(format_watch(res).replace("I'll message you when it confirms or fails.",
+                    f"(Watch list is full: {MAX_WATCHES}. Use /unwatch to free a slot.)"), chat)
     else:
         tg_send(f"⏳ <b>{pair}</b>: no clear setup yet (price {fmt(pair, res['price'])}). "
-                "Hold off and wait. I'll alert you when something forms.", chat)
+                f"Hold off. Send /watch {pair.replace('/', '')} and I'll message you as soon as one forms.", chat)
+
+
+def add_watch(pair: str, side, level, chat: str):
+    """Start watching a market: free-form (monitor) or until a 15min candle closes above/below a level."""
+    try:
+        res = analyse(pair)
+    except Exception as e:
+        tg_send(f"Couldn't load {pair}: {str(e)[:120]}. Check the symbol (e.g. EURUSD, gold, btc).", chat)
+        return
+    now_px = res["price"] if res else None
+    if level is not None and now_px is not None and ((side == "BUY" and now_px > level) or (side == "SELL" and now_px < level)):
+        tg_send(f"{pair} is already {'above' if side == 'BUY' else 'below'} {fmt(pair, level)} "
+                f"(now {fmt(pair, now_px)}). Pick a level price hasn't reached yet.", chat)
+        return
+    w = {"side": side, "trigger": level, "invalid": None, "ts": time.time(), "source": "user",
+         "expire_h": WATCH_USER_EXPIRE_HOURS, "last_price": float(now_px) if now_px is not None else None}
+    if level is None and res and res["type"] == "signal":
+        tg_send(format_signal(res), chat)  # already a setup, nothing to wait for
+        return
+    if level is None and res and res["type"] == "watch":
+        set_watch(pair, auto_watch(res))
+        tg_send(format_watch(res), chat)
+        return
+    set_watch(pair, w)
+    if level is None:
+        what = "no clear setup yet, so I'm monitoring it and will message you the moment one forms"
+    else:
+        what = (f"I'll message you when a 15min candle closes {'above' if side == 'BUY' else 'below'} "
+                f"{fmt(pair, level)} and tell you what the setup looks like then")
+    closed = "" if res else " (market looks closed right now, so I'll start when it opens)"
+    tg_send(f"👀 Watching <b>{pair}</b>: {what}{closed}.\n"
+            f"I check every {SCAN_EVERY_MIN} min and the alert goes to all chats. Stops after {WATCH_USER_EXPIRE_HOURS:g}h. "
+            f"/unwatch {pair.replace('/', '')} cancels.", chat)
+
+
+def handle_watch(args: str, chat: str):
+    t = args.split()
+    if not t:
+        tg_send(("👀 Watchlist" + watch_lines()) if _watch else
+                "Nothing on watch. Try /watch EURUSD or /watch EURUSD above 1.1250", chat)
+        return
+    pair = parse_pair(t[0])
+    side = level = None
+    if len(t) >= 3 and t[1] in ("above", "over", "up", "below", "under", "down"):
+        try:
+            level = float(t[2].replace(",", ""))
+        except ValueError:
+            tg_send("Level must be a number, e.g. /watch EURUSD above 1.1250", chat)
+            return
+        side = "BUY" if t[1] in ("above", "over", "up") else "SELL"
+    elif len(t) > 1:
+        tg_send("Usage: /watch EURUSD  or  /watch EURUSD above 1.1250  or  /watch BTC below 65000", chat)
+        return
+    if pair not in _watch and len(_watch) >= MAX_WATCHES:
+        tg_send(f"Watch list is full ({MAX_WATCHES}). Free a slot with /unwatch.{watch_lines()}", chat)
+        return
+    tg_send(f"Checking {pair}…", chat)
+    threading.Thread(target=add_watch, args=(pair, side, level, chat), daemon=True).start()
+
+
+def handle_unwatch(args: str, chat: str):
+    a = args.strip()
+    if a in ("all", "everything"):
+        for pr in list(_watch):
+            drop_watch(pr)
+        tg_send("Stopped watching everything.", chat)
+        return
+    pair = parse_pair(a) if a else None
+    if pair and pair in _watch:
+        drop_watch(pair)
+        tg_send(f"Stopped watching {pair}.", chat)
+    else:
+        tg_send("Not watching that. /watch shows the list; /unwatch EURUSD or /unwatch all.", chat)
 
 
 HELP = ("Forex SMC bot commands:\n"
         "/signal EURUSD – analyse one market now (also: gold, btc, eth, oil, nas100, spx)\n"
-        "/scan – scan all markets\n/watch – setups I'm watching\n/status – settings\n"
+        "/scan – scan all markets\n"
+        "/watch EURUSD – keep watching a market and message me when a setup forms\n"
+        "/watch EURUSD above 1.1250 – alert me when a 15min candle closes above/below a level\n"
+        "/watch – list what I'm watching, /unwatch EURUSD – stop\n/status – settings\n"
         "/id – show this chat's ID")
 
 
@@ -633,7 +801,9 @@ def poll_commands():
                     tg_send("Scanning…", chat)
                     threading.Thread(target=scan, kwargs={"force": True, "reply_chat": chat}, daemon=True).start()
                 elif cmd == "/watch":
-                    tg_send(("👀 Watchlist" + watch_lines()) if _watch else "Nothing on watch right now.", chat)
+                    handle_watch(args, chat)
+                elif cmd == "/unwatch":
+                    handle_unwatch(args, chat)
                 elif cmd == "/status":
                     tg_send(f"Pairs: {', '.join(PAIRS)}\nTF: {HTF}→{ENTRY_TF}\nMin score: {MIN_SCORE}\n"
                             f"Forex/metals session UTC: {SESSION_START_UTC}-{SESSION_END_UTC}; crypto 24/7; US ETFs 13-20\n"
@@ -675,6 +845,7 @@ def keep_awake():
 if __name__ == "__main__":
     if not (TD_KEY and TG_TOKEN and CHAT_IDS):
         raise SystemExit("Set TWELVEDATA_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID in .env")
+    load_watch()
     threading.Thread(target=serve_health, daemon=True).start()
     threading.Thread(target=keep_awake, daemon=True).start()
     tg_send("✅ Forex SMC bot started.")
