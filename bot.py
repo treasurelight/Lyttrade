@@ -52,6 +52,12 @@ MAX_DATA_AGE_MIN = int(os.getenv("MAX_DATA_AGE_MIN", "45"))   # reject stale can
 MIN_SL_PIPS = float(os.getenv("MIN_SL_PIPS", "10"))            # never give a tighter stop than this
 WATCH_SCORE = float(os.getenv("WATCH_SCORE", "4"))            # forming setup -> "hold on" alert
 WATCH_EXPIRE_HOURS = float(os.getenv("WATCH_EXPIRE_HOURS", "8"))
+# --- stricter rules for crypto (it whipsaws more than forex) ---
+CRYPTO_MIN_SCORE = float(os.getenv("CRYPTO_MIN_SCORE", "8"))
+CRYPTO_24_7 = os.getenv("CRYPTO_24_7", "false").lower() == "true"   # default: London/NY hours only
+CRYPTO_SL_BUFFER = float(os.getenv("CRYPTO_SL_BUFFER", "0.5"))      # ATRs beyond the swing
+CRYPTO_SL_MIN_ATR = float(os.getenv("CRYPTO_SL_MIN_ATR", "1.5"))    # never tighter than this
+CRYPTO_SL_MAX_ATR = float(os.getenv("CRYPTO_SL_MAX_ATR", "5"))
 HEARTBEAT_HOURS = float(os.getenv("HEARTBEAT_HOURS", "2"))     # status message when nothing to report
 EAT = timezone(timedelta(hours=3))
 _last_beat = 0.0
@@ -356,9 +362,17 @@ def analyse(pair: str, min_score: float = None):
     # 7) News sentiment (weight up to 2)
     scores, _ = get_news_scores()
     base, quote = pair.split("/") if "/" in pair else (pair, "")
-    ns = max(-2, min(2, scores.get(base, 0) - scores.get(quote, 0))) if quote else 0
+    is_crypto = asset_class(pair) == "crypto"
+    if is_crypto:  # judge the coin on its own news, not against forex USD sentiment
+        ns = max(-2, min(2, scores.get(base, 0)))
+    else:
+        ns = max(-2, min(2, scores.get(base, 0) - scores.get(quote, 0))) if quote else 0
     news_txt = "no sentiment data"
-    if scores and quote:
+    if scores and is_crypto:
+        news_txt = f"{base} {scores.get(base, 0):+} (coin news only)"
+        if ns != 0:
+            add("buy" if ns > 0 else "sell", abs(ns), f"{base} news flow is {'bullish' if ns > 0 else 'bearish'}")
+    elif scores and quote:
         news_txt = f"{base} {scores.get(base, 0):+} / {quote} {scores.get(quote, 0):+}"
         if ns > 0:
             add("buy", abs(ns), f"News flow favours {base} over {quote}")
@@ -370,20 +384,28 @@ def analyse(pair: str, min_score: float = None):
     need = MIN_SCORE if min_score is None else min_score
     htf_against = (side == "BUY" and htrend == "bear") or (side == "SELL" and htrend == "bull")
     cls = asset_class(pair)
+    sl_buf, sl_min, sl_max = 0.2, 0.8, 3.0
+    allowed = True
+    if cls == "crypto":
+        need = max(need, CRYPTO_MIN_SCORE)
+        sl_buf, sl_min, sl_max = CRYPTO_SL_BUFFER, CRYPTO_SL_MIN_ATR, CRYPTO_SL_MAX_ATR
+        # crypto must have the 4h trend AND a fresh 15min structure break pointing the same way
+        allowed = (htrend == ("bull" if side == "BUY" else "bear")
+                   and bool(brk) and ((brk["dir"] == "up") == (side == "BUY")))
 
-    if score >= need and score - opposing >= 3 and not htf_against:
+    if score >= need and score - opposing >= 3 and not htf_against and allowed:
         # Stop loss: beyond sweep/OB/recent swing, bounded by ATR
         recent = ltf.tail(12)
         if side == "BUY":
             sl_p = min(recent["low"].min(), ob_low or 1e9, sw["extreme"] if sw and sw["dir"] == "bull" else 1e9)
-            sl_p -= 0.2 * a
+            sl_p -= sl_buf * a
             risk = price - sl_p
         else:
             sl_p = max(recent["high"].max(), ob_high or -1e9, sw["extreme"] if sw and sw["dir"] == "bear" else -1e9)
-            sl_p += 0.2 * a
+            sl_p += sl_buf * a
             risk = sl_p - price
-        risk = max(risk, 0.8 * a)
-        if risk <= 3 * a:  # otherwise stop too wide: fall through to watch
+        risk = max(risk, sl_min * a)
+        if risk <= sl_max * a:  # otherwise stop too wide: fall through to watch
             if cls == "forex":
                 risk = max(risk, MIN_SL_PIPS * pip(pair))  # realistic minimum stop
             d = 1 if side == "BUY" else -1
@@ -426,7 +448,7 @@ def format_signal(s: dict) -> str:
         f"Confluence: {s['score']:.0f} pts (~{conf}%)\n"
         f"News: {html.escape(s['news'])}\n\n"
         + "\n".join(f"• {html.escape(r)}" for r in s["reasons"])
-        + "\n\n⚠️ Not financial advice. Risk ≤1% per trade. Move SL to breakeven at TP1."
+        + "\n\n⚠️ Not financial advice. Open ONE position per signal, risk ≤1%. Move SL to breakeven at TP1."
     )
 
 
@@ -456,7 +478,7 @@ def pair_in_session(pair: str) -> bool:
     cls = asset_class(pair)
     now = datetime.now(timezone.utc)
     if cls == "crypto":
-        return True  # 24/7
+        return True if CRYPTO_24_7 else in_session()  # weekday London/NY hours unless 24/7 is switched on
     if cls == "equity":  # US cash session 13:30-20:00 UTC
         return now.weekday() < 5 and 13 <= now.hour < 20
     return in_session()
