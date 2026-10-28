@@ -58,6 +58,14 @@ CRYPTO_24_7 = os.getenv("CRYPTO_24_7", "false").lower() == "true"   # default: L
 CRYPTO_SL_BUFFER = float(os.getenv("CRYPTO_SL_BUFFER", "0.5"))      # ATRs beyond the swing
 CRYPTO_SL_MIN_ATR = float(os.getenv("CRYPTO_SL_MIN_ATR", "1.5"))    # never tighter than this
 CRYPTO_SL_MAX_ATR = float(os.getenv("CRYPTO_SL_MAX_ATR", "5"))
+# --- account protection (position sizing + limits) ---
+START_BALANCE = float(os.getenv("BALANCE", "20"))
+START_RISK_PCT = float(os.getenv("RISK_PCT", "1"))                  # % of balance risked per trade
+DAILY_LOSS_PCT = float(os.getenv("DAILY_LOSS_PCT", "5"))            # stop sending signals after this day-loss
+MAX_LOSS_STREAK = int(os.getenv("MAX_LOSS_STREAK", "3"))            # pause after N losses in a row
+MAX_SIGNALS_PER_DAY = int(os.getenv("MAX_SIGNALS_PER_DAY", "5"))
+CONTRACT_SCALE = float(os.getenv("CONTRACT_SCALE", "1"))            # <1 if your lots are smaller (e.g. cent account)
+STATE_FILE = os.getenv("STATE_FILE", "account_state.json")
 HEARTBEAT_HOURS = float(os.getenv("HEARTBEAT_HOURS", "2"))     # status message when nothing to report
 EAT = timezone(timedelta(hours=3))
 _last_beat = 0.0
@@ -435,6 +443,158 @@ def analyse(pair: str, min_score: float = None):
     return {"type": "none", "price": price}
 
 
+# ---------------- account: sizing, limits, journal ----------------
+_acct = {"balance": START_BALANCE, "risk_pct": START_RISK_PCT, "day": "", "day_start": START_BALANCE,
+         "day_pl": 0.0, "streak": 0, "signals_today": 0, "notice_day": "", "trades": []}
+
+
+def utc_day() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def save_acct():
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump(_acct, f)
+    except Exception as e:
+        log.warning("couldn't save account state: %s", e)
+
+
+def load_acct():
+    try:
+        with open(STATE_FILE) as f:
+            _acct.update(json.load(f))
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log.warning("couldn't load account state: %s", e)
+    roll_day()
+
+
+def roll_day():
+    today = utc_day()
+    if _acct["day"] != today:
+        _acct.update(day=today, day_start=_acct["balance"], day_pl=0.0, streak=0, signals_today=0)
+        save_acct()
+
+
+def usd_per_unit(pair: str, price: float):
+    """USD gained/lost per 1.0 price move per 1.0 lot (Exness Standard contract sizes). None if unknown."""
+    cls = asset_class(pair)
+    v = None
+    if cls == "forex":
+        base, quote = pair.split("/")
+        if quote == "USD":
+            v = 100000.0
+        elif base == "USD":
+            v = 100000.0 / price
+    elif cls == "metal":
+        v = {"XAU": 100.0, "XAG": 5000.0}.get(pair.split("/")[0])
+    elif cls == "crypto":
+        v = 1.0  # 1 lot = 1 coin
+    return v * CONTRACT_SCALE if v else None
+
+
+def size_text(sg: dict) -> str:
+    roll_day()
+    p, bal, rp = sg["pair"], _acct["balance"], _acct["risk_pct"]
+    risk_usd = bal * rp / 100
+    dist = abs(sg["entry"] - sg["sl"])
+    if asset_class(p) == "equity":
+        return (f"📐 Stop is {dist / sg['entry'] * 100:.2f}% from entry. Size your trade so a move that big costs "
+                f"about ${risk_usd:.2f} ({rp:g}% of ${bal:.2f}). These are ETF prices: place the levels on your broker's chart.")
+    v = usd_per_unit(p, sg["entry"])
+    if not v:
+        return "📐 Couldn't work out the lot size for this symbol. Size it by hand so the stop costs about " \
+               f"${risk_usd:.2f}."
+    per_min = dist * v * 0.01                      # cost of the smallest trade
+    lot = int((risk_usd / (dist * v)) / 0.01) * 0.01
+    if lot < 0.01:
+        return (f"⚠️ <b>Too big for your balance:</b> even the smallest trade (0.01 lot) risks ${per_min:.2f} "
+                f"({per_min / bal * 100:.1f}% of ${bal:.2f}); your limit is {rp:g}% (${risk_usd:.2f}). "
+                "Skip this one unless you accept that risk.")
+    risk_now = lot * dist * v
+    return (f"📐 <b>Lot size: {lot:.2f}</b> (risks about ${risk_now:.2f} = {risk_now / bal * 100:.1f}% of ${bal:.2f}; "
+            f"TP1 about +${risk_now * MIN_RR:.2f})")
+
+
+def signals_blocked():
+    """Why scheduled signals are paused today, or None."""
+    roll_day()
+    if _acct["day_pl"] <= -_acct["day_start"] * DAILY_LOSS_PCT / 100:
+        return f"daily loss limit hit (down ${-_acct['day_pl']:.2f} today, limit {DAILY_LOSS_PCT:g}%)"
+    if _acct["streak"] >= MAX_LOSS_STREAK:
+        return f"{_acct['streak']} losses in a row"
+    if _acct["signals_today"] >= MAX_SIGNALS_PER_DAY:
+        return f"already sent {MAX_SIGNALS_PER_DAY} signals today"
+    return None
+
+
+def record_result(amount: float, chat: str):
+    roll_day()
+    _acct["balance"] = round(_acct["balance"] + amount, 2)
+    _acct["day_pl"] = round(_acct["day_pl"] + amount, 2)
+    _acct["streak"] = 0 if amount >= 0 else _acct["streak"] + 1
+    _acct["trades"] = (_acct["trades"] + [{"t": time.time(), "amt": amount}])[-300:]
+    save_acct()
+    tg_send(f"{'✅ Win' if amount >= 0 else '❌ Loss'} recorded: {amount:+.2f}. Balance ${_acct['balance']:.2f}. "
+            f"Today {_acct['day_pl']:+.2f}." + (f"\n🛑 {signals_blocked()}: no more signals today." if signals_blocked()
+            and _acct["notice_day"] != utc_day() else ""), chat)
+
+
+def journal_text() -> str:
+    roll_day()
+    tr = [t["amt"] for t in _acct["trades"]]
+    if not tr:
+        return ("📒 No trades recorded yet. After each trade send /won 3.20 or /lost 1.50 (amount in USD) "
+                "and I'll track your balance, win rate and limits.")
+    w = [x for x in tr if x >= 0]; l = [x for x in tr if x < 0]
+    avg_w = sum(w) / len(w) if w else 0; avg_l = sum(l) / len(l) if l else 0
+    return (f"📒 <b>Journal</b>: {len(tr)} trades, {len(w)} wins / {len(l)} losses ({len(w) / len(tr) * 100:.0f}% win rate)\n"
+            f"Net P/L: {sum(tr):+.2f} · avg win {avg_w:+.2f} · avg loss {avg_l:+.2f}\n"
+            f"Balance: ${_acct['balance']:.2f} · today {_acct['day_pl']:+.2f} · loss streak {_acct['streak']}\n"
+            f"Risk per trade: {_acct['risk_pct']:g}% · daily loss limit {DAILY_LOSS_PCT:g}% · "
+            f"signals today {_acct['signals_today']}/{MAX_SIGNALS_PER_DAY}")
+
+
+def handle_account_cmd(cmd: str, args: str, chat: str):
+    def num():
+        try:
+            return float(args.split()[0].replace(",", "").replace("$", ""))
+        except (IndexError, ValueError):
+            return None
+    if cmd == "/balance":
+        v = num()
+        if v is None or v <= 0:
+            tg_send(f"Balance is ${_acct['balance']:.2f}. Set it with /balance 20", chat)
+            return
+        roll_day(); _acct["balance"] = round(v, 2); _acct["day_start"] = round(v - _acct["day_pl"], 2); save_acct()
+        tg_send(f"Balance set to ${v:.2f}. Risk {_acct['risk_pct']:g}% per trade = ${v * _acct['risk_pct'] / 100:.2f}.", chat)
+    elif cmd == "/risk":
+        v = num()
+        if v is None or not (0.1 <= v <= 10):
+            tg_send(f"Risk per trade is {_acct['risk_pct']:g}%. Set it with /risk 1 (allowed 0.1 to 10).", chat)
+            return
+        _acct["risk_pct"] = v; save_acct()
+        tg_send(f"Risk per trade set to {v:g}% (${_acct['balance'] * v / 100:.2f} on ${_acct['balance']:.2f}).", chat)
+    elif cmd in ("/won", "/lost"):
+        v = num()
+        if v is None or v < 0:
+            tg_send(f"Usage: {cmd} 3.20  (amount in USD)", chat)
+            return
+        record_result(v if cmd == "/won" else -v, chat)
+    elif cmd == "/undo":
+        if not _acct["trades"]:
+            tg_send("Nothing to undo.", chat)
+            return
+        amt = _acct["trades"].pop()["amt"]
+        _acct["balance"] = round(_acct["balance"] - amt, 2); _acct["day_pl"] = round(_acct["day_pl"] - amt, 2)
+        _acct["streak"] = 0; save_acct()
+        tg_send(f"Undid the last trade ({amt:+.2f}). Balance ${_acct['balance']:.2f}.", chat)
+    elif cmd == "/journal":
+        tg_send(journal_text(), chat)
+
+
 def format_signal(s: dict) -> str:
     p = s["pair"]
     emoji = "🟢" if s["side"] == "BUY" else "🔴"
@@ -448,7 +608,8 @@ def format_signal(s: dict) -> str:
         f"Confluence: {s['score']:.0f} pts (~{conf}%)\n"
         f"News: {html.escape(s['news'])}\n\n"
         + "\n".join(f"• {html.escape(r)}" for r in s["reasons"])
-        + "\n\n⚠️ Not financial advice. Open ONE position per signal, risk ≤1%. Move SL to breakeven at TP1."
+        + "\n\n" + size_text(s)
+        + "\n⚠️ Not financial advice. Open ONE position per signal. Move SL to breakeven at TP1."
     )
 
 
@@ -563,10 +724,20 @@ def scan(force: bool = False, reply_chat: str = None):
             if not res:
                 continue  # stale data
             if res["type"] == "signal":
+                why = None if reply_chat else signals_blocked()
+                if why:
+                    log.info("%s signal held back: %s", pair, why)
+                    if _acct["notice_day"] != utc_day():
+                        _acct["notice_day"] = utc_day(); save_acct()
+                        tg_send(f"🛑 Signals paused for today: {why}. Resumes at 00:00 UTC (03:00 EAT). "
+                                "/journal shows your stats.")
+                    continue
                 head = "✅ <b>CONFIRMED</b> (was on watch)\n" if w else ""
                 tg_send(head + format_signal(res), reply_chat)
                 _watch.pop(pair, None)
                 _last_signal[pair] = datetime.now()
+                if not reply_chat:
+                    _acct["signals_today"] += 1; save_acct()
                 sent += 1
             elif w:
                 px = res["price"]
@@ -641,6 +812,8 @@ def signal_for(pair: str, chat: str):
 HELP = ("Forex SMC bot commands:\n"
         "/signal EURUSD – analyse one market now (also: gold, btc, eth, oil, nas100, spx)\n"
         "/scan – scan all markets\n/watch – setups I'm watching\n/status – settings\n"
+        "/balance 20 – set your balance · /risk 1 – risk % per trade (lot size is added to every signal)\n"
+        "/won 3.20 · /lost 1.50 – record a result (updates balance and limits) · /undo · /journal – stats\n"
         "/id – show this chat's ID")
 
 
@@ -683,11 +856,14 @@ def poll_commands():
                 elif cmd == "/scan":
                     tg_send("Scanning…", chat)
                     threading.Thread(target=scan, kwargs={"force": True, "reply_chat": chat}, daemon=True).start()
+                elif cmd in ("/balance", "/risk", "/won", "/lost", "/undo", "/journal"):
+                    handle_account_cmd(cmd, args, chat)
                 elif cmd == "/watch":
                     tg_send(("👀 Watchlist" + watch_lines()) if _watch else "Nothing on watch right now.", chat)
                 elif cmd == "/status":
                     tg_send(f"Pairs: {', '.join(PAIRS)}\nTF: {HTF}→{ENTRY_TF}\nMin score: {MIN_SCORE}\n"
                             f"Forex/metals session UTC: {SESSION_START_UTC}-{SESSION_END_UTC}; crypto {'24/7' if CRYPTO_24_7 else 'same hours'} (min score {CRYPTO_MIN_SCORE:g}); US ETFs 13-20\n"
+                            f"Balance ${_acct['balance']:.2f} · risk {_acct['risk_pct']:g}%/trade · loss limit {DAILY_LOSS_PCT:g}%/day · max {MAX_SIGNALS_PER_DAY} signals/day\n"
                             f"Scan every {SCAN_EVERY_MIN} min · data calls today: {_calls['n']}/800\n"
                             f"News scoring: {'Alpha Vantage' if AV_KEY else ('Finnhub+Claude' if FINNHUB_KEY and ANTHROPIC_KEY else 'off (ALPHAVANTAGE_API_KEY not set)')}", chat)
         except Exception as e:
@@ -727,6 +903,7 @@ def keep_awake():
 if __name__ == "__main__":
     if not (TD_KEY and TG_TOKEN and CHAT_IDS):
         raise SystemExit("Set TWELVEDATA_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID in .env")
+    load_acct()
     threading.Thread(target=serve_health, daemon=True).start()
     threading.Thread(target=keep_awake, daemon=True).start()
     tg_send("✅ Forex SMC bot started.")
