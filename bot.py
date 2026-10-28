@@ -687,9 +687,9 @@ def poll_commands():
                     tg_send(("👀 Watchlist" + watch_lines()) if _watch else "Nothing on watch right now.", chat)
                 elif cmd == "/status":
                     tg_send(f"Pairs: {', '.join(PAIRS)}\nTF: {HTF}→{ENTRY_TF}\nMin score: {MIN_SCORE}\n"
-                            f"Forex/metals session UTC: {SESSION_START_UTC}-{SESSION_END_UTC}; crypto 24/7; US ETFs 13-20\n"
+                            f"Forex/metals session UTC: {SESSION_START_UTC}-{SESSION_END_UTC}; crypto {'24/7' if CRYPTO_24_7 else 'same hours'} (min score {CRYPTO_MIN_SCORE:g}); US ETFs 13-20\n"
                             f"Scan every {SCAN_EVERY_MIN} min · data calls today: {_calls['n']}/800\n"
-                            f"News scoring: {'Alpha Vantage' if AV_KEY else ('Finnhub+Claude' if FINNHUB_KEY and ANTHROPIC_KEY else 'off')}", chat)
+                            f"News scoring: {'Alpha Vantage' if AV_KEY else ('Finnhub+Claude' if FINNHUB_KEY and ANTHROPIC_KEY else 'off (ALPHAVANTAGE_API_KEY not set)')}", chat)
         except Exception as e:
             log.error("poll error: %s", e)
             time.sleep(5)
