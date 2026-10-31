@@ -626,14 +626,30 @@ def heartbeat(msg: str):
         _last_beat = time.time()
 
 
+_closed_notified = {"v": False}
+
+
+def expire_watches():
+    """Drop watches nothing came of, even while markets are closed. One combined message."""
+    old = [p for p, w in _watch.items() if time.time() - w["ts"] > WATCH_EXPIRE_HOURS * 3600]
+    if old:
+        names = ", ".join(f"{_watch[p]['side']} {p}" for p in old)
+        for p in old:
+            _watch.pop(p, None)
+        tg_send(f"⌛ Dropped old watches (nothing confirmed in {WATCH_EXPIRE_HOURS:g}h): {names}.")
+
+
 def scan(force: bool = False, reply_chat: str = None):
     global _last_beat
+    expire_watches()
     pairs = [p for p in PAIRS if (pair_market_open(p) if force else pair_in_session(p))]
     if not pairs:
         log.info("no markets in session, skipping")
-        if not force:
-            heartbeat(status_text())
+        if not force and not _closed_notified["v"]:  # say it once per closure, not every 2 hours
+            tg_send(status_text())
+            _closed_notified["v"] = True
         return
+    _closed_notified["v"] = False
     sent = 0
     try:
         get_news_scores()
