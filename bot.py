@@ -485,18 +485,13 @@ def size_text(sg: dict) -> str:
     risk_usd = bal * rp / 100
     dist = abs(sg["entry"] - sg["sl"])
     if asset_class(p) == "equity":
-        return (f"📐 Stop is {dist / sg['entry'] * 100:.2f}% from entry. Size your trade so a move that big costs "
-                f"about ${risk_usd:.2f} ({rp:g}% of ${bal:.2f}). These are ETF prices: place the levels on your broker's chart.")
+        return f"📐 Stop is {dist / sg['entry'] * 100:.2f}% from entry (ETF price, not your broker's)"
     v = usd_per_unit(p, sg["entry"])
     if not v:
-        return "📐 Couldn't work out the lot size for this symbol. Size it by hand so the stop costs about " \
-               f"${risk_usd:.2f}."
-    per_min = dist * v * 0.01                      # cost of the smallest trade
+        return ""
     lot = int((risk_usd / (dist * v)) / 0.01) * 0.01
     if lot < 0.01:
-        return (f"⚠️ <b>Too big for your balance:</b> even the smallest trade (0.01 lot) risks ${per_min:.2f} "
-                f"({per_min / bal * 100:.1f}% of ${bal:.2f}); your limit is {rp:g}% (${risk_usd:.2f}). "
-                "Skip this one unless you accept that risk.")
+        return ""  # balance too small for this stop: say nothing rather than add a warning
     risk_now = lot * dist * v
     return (f"📐 <b>Lot size: {lot:.2f}</b> (risks about ${risk_now:.2f} = {risk_now / bal * 100:.1f}% of ${bal:.2f}; "
             f"TP1 about +${risk_now * MIN_RR:.2f})")
@@ -528,6 +523,7 @@ def format_signal(s: dict) -> str:
     p = s["pair"]
     emoji = "🟢" if s["side"] == "BUY" else "🔴"
     conf = min(100, int(s["score"] / 13 * 100))
+    size = size_text(s)
     return (
         f"{emoji} <b>{s['side']} {p}</b>\n"
         f"Entry: <code>{fmt(p, s['entry'])}</code>\n"
@@ -537,8 +533,7 @@ def format_signal(s: dict) -> str:
         f"Confluence: {s['score']:.0f} pts (~{conf}%)\n"
         f"News: {html.escape(s['news'])}\n\n"
         + "\n".join(f"• {html.escape(r)}" for r in s["reasons"])
-        + "\n\n" + size_text(s)
-        + "\n⚠️ Not financial advice. Open ONE position per signal. Move SL to breakeven at TP1."
+        + (f"\n\n{size}" if size else "")
     )
 
 
