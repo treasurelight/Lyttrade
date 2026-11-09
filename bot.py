@@ -38,10 +38,10 @@ AV_REFRESH_HOURS = float(os.getenv("AV_REFRESH_HOURS", "8"))   # ~7 calls per re
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-5-5")
 
 PAIRS = [p.strip() for p in os.getenv(
-    "PAIRS", "EUR/USD,GBP/USD,USD/JPY,XAU/USD,BTC/USD,ETH/USD,SPY,QQQ,USO").split(",") if p.strip()]
+    "PAIRS", "EUR/USD,GBP/USD,USD/JPY,XAU/USD,BTC/USD,ETH/USD,GBP/JPY,AUD/USD,USO").split(",") if p.strip()]
 ENTRY_TF = os.getenv("ENTRY_TF", "15min")
 HTF = os.getenv("HTF", "4h")
-MIN_SCORE = float(os.getenv("MIN_SCORE", "6"))          # max possible is ~13
+MIN_SCORE = float(os.getenv("MIN_SCORE", "5"))          # max possible is ~13
 MIN_RR = float(os.getenv("MIN_RR", "2"))
 CLOSED_ONLY = os.getenv("CLOSED_ONLY", "true").lower() != "false"
 MAX_LIVE_DRIFT_ATR = float(os.getenv("MAX_LIVE_DRIFT_ATR", "1.0"))
@@ -772,8 +772,7 @@ def scheduler():
 
 
 ALIASES = {"GOLD": "XAU/USD", "XAU": "XAU/USD", "SILVER": "XAG/USD", "BTC": "BTC/USD", "BITCOIN": "BTC/USD",
-           "ETH": "ETH/USD", "OIL": "USO", "USOIL": "USO", "SPX": "SPY", "SP500": "SPY", "US500": "SPY",
-           "NAS": "QQQ", "NAS100": "QQQ", "NASDAQ": "QQQ", "US100": "QQQ"}
+           "ETH": "ETH/USD", "OIL": "USO", "USOIL": "USO"}
 
 
 def parse_pair(arg: str):
