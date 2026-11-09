@@ -19,6 +19,7 @@ import pandas as pd
 import requests
 from dotenv import load_dotenv
 
+import levels as lv
 import smc
 
 load_dotenv()
@@ -42,6 +43,9 @@ ENTRY_TF = os.getenv("ENTRY_TF", "15min")
 HTF = os.getenv("HTF", "4h")
 MIN_SCORE = float(os.getenv("MIN_SCORE", "6"))          # max possible is ~13
 MIN_RR = float(os.getenv("MIN_RR", "2"))
+LEVELS_ON = os.getenv("LEVELS_ON", "true").lower() != "false"
+MIN_TP1_RR = float(os.getenv("MIN_TP1_RR", "1.5"))
+LEVEL_NEAR_ATR = float(os.getenv("LEVEL_NEAR_ATR", "1.5"))
 SCAN_EVERY_MIN = int(os.getenv("SCAN_EVERY_MIN", "10"))
 COOLDOWN_HOURS = float(os.getenv("COOLDOWN_HOURS", "4"))
 SESSION_START_UTC = int(os.getenv("SESSION_START_UTC", "7"))   # London open
@@ -384,11 +388,36 @@ def analyse(pair: str, min_score: float = None):
         elif ns < 0:
             add("sell", abs(ns), f"News flow favours {quote} over {base}")
 
+    # 8) Support / resistance key levels (daily/weekly highs & lows, 4h swings, round numbers)
+    cls = asset_class(pair)
+    lvls, res_l, sup_l = [], None, None
+    pen_b = pen_s = 0.0
+    if LEVELS_ON:
+        try:
+            lvls = lv.key_levels(pair, cls, htf)
+            res_l, sup_l = lv.nearby(lvls, price)
+        except Exception as e:
+            log.warning("%s: key levels failed: %s", pair, e)
+    near = LEVEL_NEAR_ATR * a
+    if sup_l and price - sup_l["price"] <= near:
+        add("buy", 2 if sup_l["strength"] >= 3 else 1, f"Price at support {fmt(pair, sup_l['price'])} ({sup_l['label']})")
+    if res_l and res_l["price"] - price <= near:
+        add("sell", 2 if res_l["strength"] >= 3 else 1, f"Price at resistance {fmt(pair, res_l['price'])} ({res_l['label']})")
+    caution_b = caution_s = None
+    if res_l and res_l["price"] - price <= 2 * a:
+        pen_b = 2.0
+        caution_b = f"Caution: resistance {fmt(pair, res_l['price'])} ({res_l['label']}) just above"
+    if sup_l and price - sup_l["price"] <= 2 * a:
+        pen_s = 2.0
+        caution_s = f"Caution: support {fmt(pair, sup_l['price'])} ({sup_l['label']}) just below"
+    buy -= pen_b
+    sell -= pen_s
+
     side, score, reasons = ("BUY", buy, why_b) if buy >= sell else ("SELL", sell, why_s)
+    reasons = reasons + [c for c in ([caution_b] if side == "BUY" else [caution_s]) if c]
     opposing = sell if side == "BUY" else buy
     need = MIN_SCORE if min_score is None else min_score
     htf_against = (side == "BUY" and htrend == "bear") or (side == "SELL" and htrend == "bull")
-    cls = asset_class(pair)
     sl_buf, sl_min, sl_max = 0.2, 0.8, 3.0
     allowed = True
     if cls == "crypto":
@@ -415,10 +444,24 @@ def analyse(pair: str, min_score: float = None):
                 risk = max(risk, MIN_SL_PIPS * pip(pair))  # realistic minimum stop
             d = 1 if side == "BUY" else -1
             risk_txt = f"{risk / pip(pair):.0f} pips" if cls == "forex" else f"{risk:.2f} pts"
+            tg = {"tp1": price + d * risk * MIN_RR, "tp2": price + d * risk * (MIN_RR + 1),
+                  "rr1": MIN_RR, "rr2": MIN_RR + 1, "note": ""}
+            if lvls:
+                tg = lv.targets(side, price, risk, lvls, a, MIN_RR, MIN_RR + 1, MIN_TP1_RR)
+            if "blocked" in tg:
+                blk = tg["blocked"]
+                reasons = reasons + [f"Held back: {'resistance' if side == 'BUY' else 'support'} "
+                                     f"{fmt(pair, blk['price'])} ({blk['label']}) leaves too little room"]
+                return {"type": "watch", "pair": pair, "side": side, "trigger": blk["price"],
+                        "invalid": price - d * risk, "score": score, "reasons": reasons, "price": price}
+            near_lv = []
+            if res_l: near_lv.append(f"R {fmt(pair, res_l['price'])} ({res_l['label']})")
+            if sup_l: near_lv.append(f"S {fmt(pair, sup_l['price'])} ({sup_l['label']})")
             return {
                 "type": "signal", "pair": pair, "side": side, "entry": price,
-                "sl": price - d * risk, "tp1": price + d * risk * MIN_RR,
-                "tp2": price + d * risk * (MIN_RR + 1), "risk_txt": risk_txt, "price": price,
+                "sl": price - d * risk, "tp1": tg["tp1"], "tp2": tg["tp2"],
+                "rr1": tg["rr1"], "rr2": tg["rr2"], "tp_note": tg["note"],
+                "levels_txt": " · ".join(near_lv), "risk_txt": risk_txt, "price": price,
                 "score": score, "reasons": reasons, "news": news_txt, "htf_trend": htrend,
             }
 
@@ -494,7 +537,7 @@ def size_text(sg: dict) -> str:
         return ""  # balance too small for this stop: say nothing rather than add a warning
     risk_now = lot * dist * v
     return (f"📐 <b>Lot size: {lot:.2f}</b> (risks about ${risk_now:.2f} = {risk_now / bal * 100:.1f}% of ${bal:.2f}; "
-            f"TP1 about +${risk_now * MIN_RR:.2f})")
+            f"TP1 about +${risk_now * sg.get('rr1', MIN_RR):.2f})")
 
 
 def handle_account_cmd(cmd: str, args: str, chat: str):
@@ -528,8 +571,11 @@ def format_signal(s: dict) -> str:
         f"{emoji} <b>{s['side']} {p}</b>\n"
         f"Entry: <code>{fmt(p, s['entry'])}</code>\n"
         f"SL: <code>{fmt(p, s['sl'])}</code> ({s['risk_txt']})\n"
-        f"TP1: <code>{fmt(p, s['tp1'])}</code> (1:{MIN_RR:g})\n"
-        f"TP2: <code>{fmt(p, s['tp2'])}</code> (1:{MIN_RR + 1:g})\n"
+        f"TP1: <code>{fmt(p, s['tp1'])}</code> (1:{s.get('rr1', MIN_RR):.1f})\n"
+        f"TP2: <code>{fmt(p, s['tp2'])}</code> (1:{s.get('rr2', MIN_RR + 1):.1f})\n"
+        + (f"ℹ️ {html.escape(s['tp_note'])}\n" if s.get("tp_note") else "")
+        + (f"Levels: {html.escape(s['levels_txt'])}\n" if s.get("levels_txt") else "") +
+        f""
         f"Confluence: {s['score']:.0f} pts (~{conf}%)\n"
         f"News: {html.escape(s['news'])}\n\n"
         + "\n".join(f"• {html.escape(r)}" for r in s["reasons"])
@@ -835,6 +881,6 @@ if __name__ == "__main__":
     load_acct()
     threading.Thread(target=serve_health, daemon=True).start()
     threading.Thread(target=keep_awake, daemon=True).start()
-    tg_send("✅ Forex SMC bot started.")
+    tg_send("✅ Lyttrade bot started.")
     threading.Thread(target=scheduler, daemon=True).start()
     poll_commands()

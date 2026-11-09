@@ -11,3 +11,6 @@ Scans forex pairs (SMC structure, order blocks, FVG, liquidity sweeps, EMA/RSI, 
 Build: `pip install -r requirements.txt` · Start: `python bot.py`
 Env vars: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TWELVEDATA_API_KEY (+ optional FINNHUB_API_KEY, ANTHROPIC_API_KEY).
 Use a paid plan: free web services sleep and the bot would stop.
+
+## Support / resistance
+Key levels (previous day/week high-low, 4h swings, round numbers) add score at support/resistance, penalise trades into a level, and shorten TPs before strong levels. Env: LEVELS_ON=true, MIN_TP1_RR=1.5, LEVEL_NEAR_ATR=1.5.
