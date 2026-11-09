@@ -51,14 +51,38 @@ def _cluster(levels, tol):
     return out
 
 
-def key_levels(pair: str, cls: str, htf: pd.DataFrame):
-    """Sorted list of {price, strength (2-5), label}."""
+def ltf_levels(ltf: pd.DataFrame, lookback: int = 200):
+    """Recent entry-timeframe swing highs/lows. A swing that price clearly turned away from
+    (moved 1.5 ATR the other way within 12 candles) counts as a rejection level (strength 2),
+    any other swing counts 1. Levels tested twice add up, so repeated rejections become strong."""
+    a = float(smc.atr(ltf).iloc[-1])
+    hi, lo = ltf["high"].values, ltf["low"].values
+    sh, sl = smc.swings(ltf, 3)
+    start = max(0, len(ltf) - lookback)
+    out = []
+    for i, p in sh:
+        if i >= start:
+            fut = lo[i + 1:i + 13]
+            rej = len(fut) > 0 and fut.min() <= p - 1.5 * a
+            out.append((float(p), 2 if rej else 1, "15m high" if rej else "15m swing"))
+    for i, p in sl:
+        if i >= start:
+            fut = hi[i + 1:i + 13]
+            rej = len(fut) > 0 and fut.max() >= p + 1.5 * a
+            out.append((float(p), 2 if rej else 1, "15m low" if rej else "15m swing"))
+    return out
+
+
+def key_levels(pair: str, cls: str, htf: pd.DataFrame, ltf: pd.DataFrame = None):
+    """Sorted list of {price, strength (1-5), label}."""
     atr_h = float(smc.atr(htf).iloc[-1])
     price = float(htf["close"].iloc[-1])
     raw = _prev_period(htf)
     sh, sl = smc.swings(htf, 3)
     raw += [(float(p), 2, "swing") for _, p in sh[-8:]]
     raw += [(float(p), 2, "swing") for _, p in sl[-8:]]
+    if ltf is not None and len(ltf) > 30:
+        raw += ltf_levels(ltf)
     step = _round_step(pair, cls)
     if step:
         span = 6 * atr_h

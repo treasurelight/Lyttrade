@@ -43,6 +43,8 @@ ENTRY_TF = os.getenv("ENTRY_TF", "15min")
 HTF = os.getenv("HTF", "4h")
 MIN_SCORE = float(os.getenv("MIN_SCORE", "6"))          # max possible is ~13
 MIN_RR = float(os.getenv("MIN_RR", "2"))
+CLOSED_ONLY = os.getenv("CLOSED_ONLY", "true").lower() != "false"
+MAX_LIVE_DRIFT_ATR = float(os.getenv("MAX_LIVE_DRIFT_ATR", "1.0"))
 LEVELS_ON = os.getenv("LEVELS_ON", "true").lower() != "false"
 MIN_TP1_RR = float(os.getenv("MIN_TP1_RR", "1.5"))
 LEVEL_NEAR_ATR = float(os.getenv("LEVEL_NEAR_ATR", "1.5"))
@@ -290,16 +292,29 @@ def pip(pair: str) -> float:
     return 0.01 if "JPY" in pair else 0.0001
 
 
+def tf_minutes(tf: str) -> int:
+    m = re.match(r"(\d+)\s*(min|h|day)", tf)
+    return int(m.group(1)) * {"min": 1, "h": 60, "day": 1440}[m.group(2)] if m else 15
+
+
 def analyse(pair: str, min_score: float = None):
     """Returns {"type": "signal"|"watch"|"none", ...} or None when data is stale."""
     ltf = fetch_candles(pair, ENTRY_TF, 300)
     htf = get_htf(pair)
-    age_min = (datetime.now(timezone.utc).replace(tzinfo=None) - ltf["datetime"].iloc[-1]).total_seconds() / 60
+    now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+    age_min = (now_utc - ltf["datetime"].iloc[-1]).total_seconds() / 60
     if age_min > MAX_DATA_AGE_MIN:
         log.info("%s: latest candle is %.0f min old (market closed/stale feed), skipping", pair, age_min)
         return None
+    live = float(ltf["close"].iloc[-1])
+    if CLOSED_ONLY and age_min < tf_minutes(ENTRY_TF):
+        ltf = ltf.iloc[:-1].reset_index(drop=True)  # last candle still forming: judge closed candles only
     price = ltf["close"].iloc[-1]
     a = smc.atr(ltf).iloc[-1]
+    if abs(live - price) > MAX_LIVE_DRIFT_ATR * a:
+        log.info("%s: price moved %.1f ATR since the last closed candle, waiting for it to settle", pair,
+                 abs(live - price) / a)
+        return {"type": "none", "price": live}
 
     buy, sell = 0.0, 0.0
     why_b, why_s = [], []
@@ -394,7 +409,7 @@ def analyse(pair: str, min_score: float = None):
     pen_b = pen_s = 0.0
     if LEVELS_ON:
         try:
-            lvls = lv.key_levels(pair, cls, htf)
+            lvls = lv.key_levels(pair, cls, htf, ltf)
             res_l, sup_l = lv.nearby(lvls, price)
         except Exception as e:
             log.warning("%s: key levels failed: %s", pair, e)
@@ -443,25 +458,30 @@ def analyse(pair: str, min_score: float = None):
             if cls == "forex":
                 risk = max(risk, MIN_SL_PIPS * pip(pair))  # realistic minimum stop
             d = 1 if side == "BUY" else -1
+            sl_abs = price - d * risk          # stop from structure (closed candles)
+            entry = live                        # enter at the live price
+            risk = d * (entry - sl_abs)
+            if risk <= 0.3 * a:
+                return {"type": "none", "price": live}
             risk_txt = f"{risk / pip(pair):.0f} pips" if cls == "forex" else f"{risk:.2f} pts"
-            tg = {"tp1": price + d * risk * MIN_RR, "tp2": price + d * risk * (MIN_RR + 1),
+            tg = {"tp1": entry + d * risk * MIN_RR, "tp2": entry + d * risk * (MIN_RR + 1),
                   "rr1": MIN_RR, "rr2": MIN_RR + 1, "note": ""}
             if lvls:
-                tg = lv.targets(side, price, risk, lvls, a, MIN_RR, MIN_RR + 1, MIN_TP1_RR)
+                tg = lv.targets(side, entry, risk, lvls, a, MIN_RR, MIN_RR + 1, MIN_TP1_RR)
             if "blocked" in tg:
                 blk = tg["blocked"]
                 reasons = reasons + [f"Held back: {'resistance' if side == 'BUY' else 'support'} "
                                      f"{fmt(pair, blk['price'])} ({blk['label']}) leaves too little room"]
                 return {"type": "watch", "pair": pair, "side": side, "trigger": blk["price"],
-                        "invalid": price - d * risk, "score": score, "reasons": reasons, "price": price}
+                        "invalid": sl_abs, "score": score, "reasons": reasons, "price": live}
             near_lv = []
             if res_l: near_lv.append(f"R {fmt(pair, res_l['price'])} ({res_l['label']})")
             if sup_l: near_lv.append(f"S {fmt(pair, sup_l['price'])} ({sup_l['label']})")
             return {
-                "type": "signal", "pair": pair, "side": side, "entry": price,
-                "sl": price - d * risk, "tp1": tg["tp1"], "tp2": tg["tp2"],
+                "type": "signal", "pair": pair, "side": side, "entry": entry,
+                "sl": sl_abs, "tp1": tg["tp1"], "tp2": tg["tp2"],
                 "rr1": tg["rr1"], "rr2": tg["rr2"], "tp_note": tg["note"],
-                "levels_txt": " · ".join(near_lv), "risk_txt": risk_txt, "price": price,
+                "levels_txt": " · ".join(near_lv), "risk_txt": risk_txt, "price": live,
                 "score": score, "reasons": reasons, "news": news_txt, "htf_trend": htrend,
             }
 
@@ -478,9 +498,9 @@ def analyse(pair: str, min_score: float = None):
             inv = above[-1] if above else price + 2 * a
         inv = min(inv, price - 0.5 * a) if side == "BUY" else max(inv, price + 0.5 * a)
         return {"type": "watch", "pair": pair, "side": side, "trigger": trig, "invalid": inv,
-                "score": score, "reasons": reasons, "price": price}
+                "score": score, "reasons": reasons, "price": live}
 
-    return {"type": "none", "price": price}
+    return {"type": "none", "price": live}
 
 
 # ---------------- account: lot sizing ----------------

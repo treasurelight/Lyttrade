@@ -14,3 +14,5 @@ Use a paid plan: free web services sleep and the bot would stop.
 
 ## Support / resistance
 Key levels (previous day/week high-low, 4h swings, round numbers) add score at support/resistance, penalise trades into a level, and shorten TPs before strong levels. Env: LEVELS_ON=true, MIN_TP1_RR=1.5, LEVEL_NEAR_ATR=1.5.
+
+Env: CLOSED_ONLY=true (judge closed candles only), MAX_LIVE_DRIFT_ATR=1.0 (skip if price ran >1 ATR since the last closed candle). 15m swing/rejection levels now count as levels.
