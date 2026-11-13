@@ -16,3 +16,6 @@ Use a paid plan: free web services sleep and the bot would stop.
 Key levels (previous day/week high-low, 4h swings, round numbers) add score at support/resistance, penalise trades into a level, and shorten TPs before strong levels. Env: LEVELS_ON=true, MIN_TP1_RR=1.5, LEVEL_NEAR_ATR=1.5.
 
 Env: CLOSED_ONLY=true (judge closed candles only), MAX_LIVE_DRIFT_ATR=1.0 (skip if price ran >1 ATR since the last closed candle). 15m swing/rejection levels now count as levels.
+
+## Asian session
+Between `ASIAN_START_UTC` (default 0) and `SESSION_START_UTC` (7) the bot also scans `ASIAN_PAIRS` (default USD/JPY, GBP/JPY, AUD/USD, XAU/USD) on weekdays. Only those pairs are scanned, to protect the 800/day data limit. Set `ASIAN_SESSION=false` to turn it off.

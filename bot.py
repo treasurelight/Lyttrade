@@ -52,6 +52,10 @@ SCAN_EVERY_MIN = int(os.getenv("SCAN_EVERY_MIN", "10"))
 COOLDOWN_HOURS = float(os.getenv("COOLDOWN_HOURS", "4"))
 SESSION_START_UTC = int(os.getenv("SESSION_START_UTC", "7"))   # London open
 SESSION_END_UTC = int(os.getenv("SESSION_END_UTC", "20"))      # NY close-ish
+# Asian night session: scans only a few pairs (saves the 800/day data limit). 0 = off.
+ASIAN_ON = os.getenv("ASIAN_SESSION", "true").lower() == "true"
+ASIAN_START_UTC = int(os.getenv("ASIAN_START_UTC", "0"))       # 03:00 Uganda
+ASIAN_PAIRS = [p.strip().upper() for p in os.getenv("ASIAN_PAIRS", "USD/JPY,GBP/JPY,AUD/USD,XAU/USD").split(",") if p.strip()]
 NEWS_BLACKOUT_MIN = int(os.getenv("NEWS_BLACKOUT_MIN", "30"))
 API_PAUSE_SEC = float(os.getenv("API_PAUSE_SEC", "8"))         # free TwelveData: 8 req/min
 MAX_DATA_AGE_MIN = int(os.getenv("MAX_DATA_AGE_MIN", "45"))   # reject stale candles
@@ -625,6 +629,12 @@ def in_session() -> bool:
     return now.weekday() < 5 and SESSION_START_UTC <= now.hour < SESSION_END_UTC
 
 
+def in_asian() -> bool:
+    """Asian window before London opens (weekdays)."""
+    now = datetime.now(timezone.utc)
+    return now.weekday() < 5 and ASIAN_START_UTC <= now.hour < SESSION_START_UTC
+
+
 def pair_in_session(pair: str) -> bool:
     cls = asset_class(pair)
     now = datetime.now(timezone.utc)
@@ -632,6 +642,8 @@ def pair_in_session(pair: str) -> bool:
         return True if CRYPTO_24_7 else in_session()  # weekday London/NY hours unless 24/7 is switched on
     if cls == "equity":  # US cash session 13:30-20:00 UTC
         return now.weekday() < 5 and 13 <= now.hour < 20
+    if ASIAN_ON and pair in ASIAN_PAIRS and in_asian():
+        return True
     return in_session()
 
 
@@ -655,7 +667,7 @@ def market_open_now() -> bool:
 
 def next_scan_start() -> datetime:
     now = datetime.now(timezone.utc)
-    d = now.replace(hour=SESSION_START_UTC, minute=0, second=0, microsecond=0)
+    d = now.replace(hour=ASIAN_START_UTC if ASIAN_ON else SESSION_START_UTC, minute=0, second=0, microsecond=0)
     if d <= now:
         d += timedelta(days=1)
     while d.weekday() >= 5:
@@ -856,7 +868,7 @@ def poll_commands():
                     tg_send(("👀 Watchlist" + watch_lines()) if _watch else "Nothing on watch right now.", chat)
                 elif cmd == "/status":
                     tg_send(f"Pairs: {', '.join(PAIRS)}\nTF: {HTF}→{ENTRY_TF}\nMin score: {MIN_SCORE}\n"
-                            f"Forex/metals session UTC: {SESSION_START_UTC}-{SESSION_END_UTC}; crypto {'24/7' if CRYPTO_24_7 else 'same hours'} (min score {CRYPTO_MIN_SCORE:g}); US ETFs 13-20\n"
+                            f"Forex/metals session UTC: {SESSION_START_UTC}-{SESSION_END_UTC}; Asian {ASIAN_START_UTC}-{SESSION_START_UTC} for {', '.join(ASIAN_PAIRS) if ASIAN_ON else 'off'}; crypto {'24/7' if CRYPTO_24_7 else 'same hours'} (min score {CRYPTO_MIN_SCORE:g}); US ETFs 13-20\n"
                             f"Balance ${_acct['balance']:.2f} · risk {_acct['risk_pct']:g}%/trade\n"
                             f"Scan every {SCAN_EVERY_MIN} min · data calls today: {_calls['n']}/800\n"
                             f"News scoring: {'Alpha Vantage' if AV_KEY else ('Finnhub+Claude' if FINNHUB_KEY and ANTHROPIC_KEY else 'off (ALPHAVANTAGE_API_KEY not set)')}", chat)
