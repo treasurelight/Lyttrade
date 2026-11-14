@@ -19,3 +19,6 @@ Env: CLOSED_ONLY=true (judge closed candles only), MAX_LIVE_DRIFT_ATR=1.0 (skip 
 
 ## Asian session
 Between `ASIAN_START_UTC` (default 0) and `SESSION_START_UTC` (7) the bot also scans `ASIAN_PAIRS` (default USD/JPY, GBP/JPY, AUD/USD, XAU/USD) on weekdays. Only those pairs are scanned, to protect the 800/day data limit. Set `ASIAN_SESSION=false` to turn it off.
+
+## Weekend crypto
+`CRYPTO_ALWAYS` (default `BTC/USD`) lists crypto pairs scanned 24/7, weekends included. Add `ETH/USD` to scan it too (uses more of the 800/day data limit). `CRYPTO_24_7=true` makes all crypto 24/7.

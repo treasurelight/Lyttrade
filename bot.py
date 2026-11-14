@@ -64,7 +64,9 @@ WATCH_SCORE = float(os.getenv("WATCH_SCORE", "4"))            # forming setup ->
 WATCH_EXPIRE_HOURS = float(os.getenv("WATCH_EXPIRE_HOURS", "8"))
 # --- stricter rules for crypto (it whipsaws more than forex) ---
 CRYPTO_MIN_SCORE = float(os.getenv("CRYPTO_MIN_SCORE", "8"))
-CRYPTO_24_7 = os.getenv("CRYPTO_24_7", "false").lower() == "true"   # default: London/NY hours only
+CRYPTO_24_7 = os.getenv("CRYPTO_24_7", "false").lower() == "true"   # all crypto around the clock
+# crypto pairs that are scanned 24/7 including weekends (keeps the data limit in check)
+CRYPTO_ALWAYS = [p.strip().upper() for p in os.getenv("CRYPTO_ALWAYS", "BTC/USD").split(",") if p.strip()]
 CRYPTO_SL_BUFFER = float(os.getenv("CRYPTO_SL_BUFFER", "0.5"))      # ATRs beyond the swing
 CRYPTO_SL_MIN_ATR = float(os.getenv("CRYPTO_SL_MIN_ATR", "1.5"))    # never tighter than this
 CRYPTO_SL_MAX_ATR = float(os.getenv("CRYPTO_SL_MAX_ATR", "5"))
@@ -639,7 +641,7 @@ def pair_in_session(pair: str) -> bool:
     cls = asset_class(pair)
     now = datetime.now(timezone.utc)
     if cls == "crypto":
-        return True if CRYPTO_24_7 else in_session()  # weekday London/NY hours unless 24/7 is switched on
+        return True if (CRYPTO_24_7 or pair in CRYPTO_ALWAYS) else in_session()  # weekday London/NY hours unless 24/7 is switched on
     if cls == "equity":  # US cash session 13:30-20:00 UTC
         return now.weekday() < 5 and 13 <= now.hour < 20
     if ASIAN_ON and pair in ASIAN_PAIRS and in_asian():
@@ -868,7 +870,7 @@ def poll_commands():
                     tg_send(("👀 Watchlist" + watch_lines()) if _watch else "Nothing on watch right now.", chat)
                 elif cmd == "/status":
                     tg_send(f"Pairs: {', '.join(PAIRS)}\nTF: {HTF}→{ENTRY_TF}\nMin score: {MIN_SCORE}\n"
-                            f"Forex/metals session UTC: {SESSION_START_UTC}-{SESSION_END_UTC}; Asian {ASIAN_START_UTC}-{SESSION_START_UTC} for {', '.join(ASIAN_PAIRS) if ASIAN_ON else 'off'}; crypto {'24/7' if CRYPTO_24_7 else 'same hours'} (min score {CRYPTO_MIN_SCORE:g}); US ETFs 13-20\n"
+                            f"Forex/metals session UTC: {SESSION_START_UTC}-{SESSION_END_UTC}; Asian {ASIAN_START_UTC}-{SESSION_START_UTC} for {', '.join(ASIAN_PAIRS) if ASIAN_ON else 'off'}; crypto {'24/7' if CRYPTO_24_7 else '24/7 for ' + ', '.join(CRYPTO_ALWAYS) + ', others same hours'} (min score {CRYPTO_MIN_SCORE:g}); US ETFs 13-20\n"
                             f"Balance ${_acct['balance']:.2f} · risk {_acct['risk_pct']:g}%/trade\n"
                             f"Scan every {SCAN_EVERY_MIN} min · data calls today: {_calls['n']}/800\n"
                             f"News scoring: {'Alpha Vantage' if AV_KEY else ('Finnhub+Claude' if FINNHUB_KEY and ANTHROPIC_KEY else 'off (ALPHAVANTAGE_API_KEY not set)')}", chat)
